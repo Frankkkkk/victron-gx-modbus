@@ -381,6 +381,7 @@ name = "victron-gx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "tokio",
  "tokio-modbus",
 ]

@@ -5,10 +5,13 @@ use tokio_modbus::{
     Slave,
 };
 
+use byteorder::{BigEndian, ByteOrder};
+
 pub struct GxDevice {
     socket_addr: SocketAddr,
 }
 
+const GX_VE_DEVICE_0: u8 = 100;
 const GX_MII_VE_BUS: u8 = 228;
 const GX_CAN_BUS_BMS: u8 = 225;
 
@@ -33,7 +36,10 @@ impl GxDevice {
 
         if let Ok(x) = x {
             ctx.disconnect().await.unwrap();
-            return Ok(x[0] as f32 / scale_factor);
+            let val = x[0];
+            let real_val = BigEndian::read_i16(&val.to_be_bytes());
+
+            return Ok(real_val as f32 / scale_factor);
         }
         return Err(anyhow::Error::msg("Error reading modbus"));
     }
@@ -72,5 +78,14 @@ impl GxDevice {
     }
     pub async fn get_battery_soc(&self) -> Result<f32, anyhow::Error> {
         self.get_modbus_u16(GX_CAN_BUS_BMS, 266, 10.).await
+    }
+
+    pub async fn get_solar_power(&self) -> Result<f32, anyhow::Error> {
+        // Basically the difference between input and output power (- inverters if seen by victron)
+        self.get_modbus_u16(GX_VE_DEVICE_0, 866, 1.).await
+    }
+
+    pub async fn get_setpoint(&self) -> Result<f32, anyhow::Error> {
+        self.get_modbus_i16(GX_VE_DEVICE_0, 2700, 1.).await
     }
 }

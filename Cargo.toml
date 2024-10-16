@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.89"
+byteorder = "1.5.0"
 tokio = "1.40.0"
 tokio-modbus = "0.15.0"
 
