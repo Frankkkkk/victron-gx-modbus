@@ -1,0 +1,12 @@
+[package]
+name = "victron-gx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+tokio = "1.40.0"
+tokio-modbus = "0.15.0"
+
+[dev-dependencies]
+tokio = { version = "1.40.0", features = ["full"] }
