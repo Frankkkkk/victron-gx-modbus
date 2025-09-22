@@ -1,7 +1,16 @@
 [package]
 name = "victron-gx"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+description = "A library to communicate with victron GX devices over MQTT"
+readme = "README.md"
+license = "MIT"
+
+documentation = "https://docs.rs/victron-gx"
+homepage = "https://forge.k3s.fr/frank/victron-gx-rs"
+repository = "https://forge.k3s.fr/frank/victron-gx-rs"
+keywords = ["victron", "multiplus", "multiplus-ii", "cerbo"]
+categories = ["api-bindings"]
 
 [dependencies]
 anyhow = "1.0.89"
