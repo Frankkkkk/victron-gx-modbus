@@ -1,45 +1,42 @@
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
-use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task;
 use tokio::time::{self, Duration};
+use tracing::{debug, error, info};
 
-#[derive(Debug, Clone, Default)]
-pub struct AcSpec {
-    pub voltage: Option<f64>,
-    pub power: Option<f64>,
-    pub frequency: Option<f64>,
-}
+use crate::ac::AcSpec;
+use crate::battery::{BatteryDC, BatterySummary};
+use crate::ess::Ess;
+use crate::pvinverter::{PvInverter, PvInverterSummary};
+use crate::traits::HandleFrame;
 
-#[derive(Debug, Clone, Default)]
-pub struct BatteryDC {
-    pub temperature: Option<f64>,
-    pub power: Option<f64>,
-    pub current: Option<f64>,
-    pub voltage: Option<f64>,
-    pub soc: Option<f64>,
-    pub soh: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SolarPower {
-    pub power: Option<f64>,
-}
+pub mod ac;
+pub mod battery;
+pub mod ess;
+pub mod pvinverter;
+pub mod traits;
 
 #[derive(Debug, Clone, Default)]
 pub struct VictronData {
     pub ac_input: AcSpec,
     pub ac_output: AcSpec,
-    pub battery_dc: BatteryDC,
-    pub solar_power: SolarPower,
+    pub ess: Ess,
+    pub batteries_dc: HashMap<u16, BatteryDC>,
+    pub pv_inverters: HashMap<u16, PvInverter>,
 }
 
 pub struct VictronGx {
+    pub serial_number: String,
     data: Arc<RwLock<VictronData>>,
     client: AsyncClient,
-    // Keep the event loop handle so it isn't dropped
+
+    shutdown: Arc<Notify>,
+
     _eventloop_handle: task::JoinHandle<()>,
+    _keepalive_handle: task::JoinHandle<()>,
 }
 
 impl VictronGx {
@@ -53,20 +50,18 @@ impl VictronGx {
         mqttoptions.set_keep_alive(Duration::from_secs(30));
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+        let data = Arc::new(RwLock::new(VictronData::default()));
+        let shutdown = Arc::new(Notify::new());
 
         let keepalive_topic = format!("R/{}/keepalive", serial_number);
-        let client2 = client.clone();
-        // Publish keepalive message
-        task::spawn(async move {
-            loop {
-                client2
-                    .publish(&keepalive_topic, QoS::AtLeastOnce, false, "")
-                    .await
-                    .unwrap();
+        let client_clone = client.clone();
+        let shutdown_clone = shutdown.clone();
 
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
-        });
+        let _keepalive_handle = task::spawn(Self::keepalive_task(
+            client_clone,
+            keepalive_topic,
+            shutdown_clone,
+        ));
 
         // Subscribe to topics with the serial number
         let topics = vec![format!("N/{}/#", serial_number)];
@@ -75,120 +70,127 @@ impl VictronGx {
             client.subscribe(topic, QoS::AtMostOnce).await?;
         }
 
-        let data = Arc::new(RwLock::new(VictronData::default()));
         let data_clone = data.clone();
-        let serial_number = serial_number.to_string();
+        let serial_number_cpy = serial_number.to_string();
 
-        // Move the event loop into the spawned task and keep the handle
+        let shutdown_clone = shutdown.clone();
         let _eventloop_handle = task::spawn(async move {
             loop {
-                match eventloop.poll().await {
-                    Ok(event) => {
-                        if let Event::Incoming(Packet::Publish(publish)) = event {
-                            let topic = publish.topic.clone();
-
-                            let payload_bytes = &publish.payload;
-                            let payload_str = String::from_utf8_lossy(payload_bytes);
-
-                            // Parse the payload as JSON
-                            let value: Option<f64> =
-                                match serde_json::from_str::<serde_json::Value>(&payload_str) {
-                                    Ok(json_value) => {
-                                        json_value.get("value").and_then(|v| v.as_f64())
-                                    }
-                                    Err(_) => None,
-                                };
-
-                            //let payload = String::from_utf8_lossy(&publish.payload).to_string();
-                            //let value: Option<f64> = payload.parse().ok();
-
-                            let mut data = data_clone.write().await;
-
-                            // Extract the part after the serial number
-                            let topic_suffix = topic
-                                .strip_prefix(&format!("N/{}/", serial_number))
-                                .unwrap_or("");
-
-                            println!(
-                                "Topic Suffix: {}, Payload: {:?}\n",
-                                topic_suffix, payload_bytes
-                            );
-
-                            match topic_suffix {
-                                // XXX Topic Suffix: system/0/Ac/In/0/DeviceInstance, Payload: b"{\"value\": 275}"
-                                // XXX bis: should we keep one phase or 3-phase?
-                                "vebus/275/Ac/ActiveIn/L1/F" => {
-                                    data.ac_input.frequency = value;
-                                }
-                                "vebus/275/Ac/ActiveIn/L1/P" => {
-                                    data.ac_input.power = value;
-                                }
-                                "vebus/275/Ac/ActiveIn/L1/V" => {
-                                    data.ac_input.voltage = value;
-                                }
-
-                                "vebus/275/Ac/Out/L1/F" => {
-                                    data.ac_output.frequency = value;
-                                }
-                                "vebus/275/Ac/Out/L1/P" => {
-                                    data.ac_output.power = value;
-                                }
-                                "vebus/275/Ac/Out/L1/V" => {
-                                    data.ac_output.voltage = value;
-                                }
-
-                                // XXX where to autodiscover 512??
-                                // N/028102353a50/system/0/ActiveBatteryService -> b'{"value": "com.victronenergy.battery/512"}'
-                                "battery/512/Dc/0/Temperature" => {
-                                    data.battery_dc.temperature = value;
-                                }
-                                "battery/512/Dc/0/Power" => {
-                                    data.battery_dc.power = value;
-                                }
-                                "battery/512/Dc/0/Current" => {
-                                    data.battery_dc.current = value;
-                                }
-                                "battery/512/Dc/0/Voltage" => {
-                                    data.battery_dc.voltage = value;
-                                }
-                                "battery/512/Soc" => {
-                                    data.battery_dc.soc = value;
-                                }
-                                "battery/512/Soh" => {
-                                    data.battery_dc.soh = value;
-                                }
-
-                                // XXX how to autodiscover 20??
-                                "pvinverter/20/Power" => {
-                                    data.solar_power.power = value;
-                                }
-
-                                // Schedules
-                                /*
-                                N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/AllowDischarge -> b'{"value": 0}'
-                                N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Day -> b'{"value": 7}'
-                                N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Duration -> b'{"value": 13800}'
-                                N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Soc -> b'{"value": 55}'
-                                N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Start -> b'{"value": 7200}'
-                                */
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error in event loop: {:?}", e);
-                        // Handle reconnection or exit
+                tokio::select! {
+                    _ = shutdown_clone.notified() => {
+                        info!("Shutting down event loop");
                         break;
+                    }
+                    event = eventloop.poll() => match event {
+                        Ok(Event::Incoming(Packet::Publish(publish))) => {
+                            Self::handle_publish(&data_clone, &serial_number_cpy, &publish.topic, &publish.payload).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("MQTT event loop error: {:?}", e);
+                            time::sleep(Duration::from_secs(5)).await;
+                        }
                     }
                 }
             }
         });
 
+        // Schedules
+        /*
+        N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/AllowDischarge -> b'{"value": 0}'
+        N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Day -> b'{"value": 7}'
+        N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Duration -> b'{"value": 13800}'
+        N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Soc -> b'{"value": 55}'
+        N/028102353a50/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/0/Start -> b'{"value": 7200}'
+        */
+
         Ok(Self {
+            serial_number: serial_number.to_string(),
             data,
             client,
+            shutdown,
             _eventloop_handle,
+            _keepalive_handle,
         })
+    }
+
+    async fn handle_publish(
+        data: &Arc<RwLock<VictronData>>,
+        serial_number: &str,
+        topic: &str,
+        payload: &[u8],
+    ) {
+        let payload_str = match std::str::from_utf8(payload) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Invalid UTF-8 payload: {:?}", e);
+                return;
+            }
+        };
+
+        let value = match serde_json::from_str::<Value>(payload_str) {
+            Ok(json) => json.get("value").and_then(|v| v.as_f64()),
+            Err(e) => {
+                error!("JSON parse error: {:?}", e);
+                None
+            }
+        };
+
+        let suffix = match topic.strip_prefix(&format!("N/{}/", serial_number)) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let parts: Vec<&str> = suffix.split('/').collect();
+        let mut data = data.write().await;
+
+        match parts.as_slice() {
+            ["vebus", "275", "Ac", "ActiveIn", rest @ ..] => {
+                data.ac_input.handle_frame(rest, value)
+            }
+            ["vebus", "275", "Ac", "Out", rest @ ..] => data.ac_output.handle_frame(rest, value),
+            ["battery", id, rest @ ..] => {
+                let id: u16 = id.parse().unwrap_or(0);
+                let battery = data.batteries_dc.entry(id).or_default();
+                battery.handle_frame(rest, value);
+            }
+            ["pvinverter", id, rest @ ..] => {
+                let id: u16 = id.parse().unwrap_or(0);
+                let inverter = data.pv_inverters.entry(id).or_default();
+                inverter.handle_frame(rest, value);
+            }
+            ["vebus", "275", "Hub4", rest @ ..] => {
+                data.ess.handle_frame(rest, value);
+            }
+            _ => {
+                debug!(
+                    "Unhandled topic: {}, parts: {:?}, value: {:?}",
+                    topic, parts, value
+                );
+            }
+        }
+    }
+    /// The MQTT server "shuts-down" (basically stops publishing anything) if
+    /// no messages are received by it for a minute or so
+    async fn keepalive_task(client: AsyncClient, topic: String, shutdown: Arc<Notify>) {
+        let mut interval = time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    info!("Shutting down keepalive task");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = client.publish(&topic, QoS::AtLeastOnce, false, "").await {
+                        error!("Keepalive publish failed: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.notify_waiters();
     }
 
     pub async fn get_ac_input(&self) -> AcSpec {
@@ -198,19 +200,69 @@ impl VictronGx {
         self.data.read().await.ac_output.clone()
     }
 
-    pub async fn get_battery_dc(&self) -> BatteryDC {
-        self.data.read().await.battery_dc.clone()
+    pub async fn get_batteries_dc(&self) -> Vec<(u16, BatteryDC)> {
+        self.data
+            .read()
+            .await
+            .batteries_dc
+            .iter()
+            .map(|(id, batt)| (*id, batt.clone()))
+            .collect()
     }
 
-    pub async fn get_solar_power(&self) -> SolarPower {
-        self.data.read().await.solar_power.clone()
+    /// Returns a summary of all batteries (average voltage, average temperature, total power)
+    pub async fn get_battery_summary(&self) -> BatterySummary {
+        let data = self.data.read().await;
+        BatterySummary::from_batteries(data.batteries_dc.values())
     }
 
-    pub async fn charge_batteries(&self) {
+    pub async fn get_pv_inverters(&self) -> Vec<(u16, PvInverter)> {
+        self.data
+            .read()
+            .await
+            .pv_inverters
+            .iter()
+            .map(|(id, inv)| (*id, inv.clone()))
+            .collect()
+    }
+
+    /// Returns a summary of all pv inverters (total power)
+    pub async fn get_pv_inverter_summary(&self) -> PvInverterSummary {
+        let data = self.data.read().await;
+        PvInverterSummary::from_pv_inverters(data.pv_inverters.values())
+    }
+
+    // TODO FIXME
+    pub async fn set_ac_power_setpoint(&self) {
         // XXX this just sets the setpoint. But the power going into the batteries
-        // depends on the consupmion of the house
+        // depends on the consumption of the house
         let topic = "W/028102353a50/settings/0/Settings/CGwacs/AcPowerSetPoint";
         let content = r#"{"value": 1234}"#;
+        if let Err(e) = self
+            .client
+            .publish(topic, QoS::AtLeastOnce, false, content)
+            .await
+        {
+            error!("Failed to set AC power setpoint: {:?}", e);
+        }
+    }
+
+    pub async fn get_ess(&self) -> Ess {
+        self.data.read().await.ess.clone()
+    }
+
+    pub async fn ess_set_setpoint(&self, value: f64) -> anyhow::Result<()> {
+        let topic = format!(
+            "W/{}/settings/0/Settings/CGwacs/AcPowerSetPoint",
+            self.serial_number
+        );
+        let content = serde_json::json!({ "value": value }).to_string();
+
+        self.client
+            .publish(topic, QoS::AtLeastOnce, false, content)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn send_mqtt(&self) -> anyhow::Result<()> {
